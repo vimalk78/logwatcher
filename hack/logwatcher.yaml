@@ -1,0 +1,51 @@
+namespace: &ns my-project
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: *ns
+  labels:
+    key1: "value1"
+    key2: "value2"
+spec:
+  finalizers:
+  - kubernetes
+---
+namespace: &ns my-project
+apiVersion: v1
+kind: Pod
+metadata:
+  name: logwatcher
+  namespace: *ns
+spec:
+  volumes:
+  - hostPath:
+      path: /var/log/pods
+      type: ""
+    name: varlogpods
+  containers:
+  - name: logwatcher
+    image: image-registry.openshift-image-registry.svc:5000/openshift/logwatcher:v0.0.1
+    args: ["sh", "-c", "/usr/local/bin/logwatcher -watch_dir=/var/log/pods -v=9 -logtostderr=true"]
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - CHOWN
+        - DAC_OVERRIDE
+        - FOWNER
+        - FSETID
+        - KILL
+        - NET_BIND_SERVICE
+        - SETGID
+        - SETPCAP
+        - SETUID
+      readOnlyRootFilesystem: true
+      seLinuxOptions:
+        type: spc_t
+      seccompProfile:
+        type: RuntimeDefault
+    volumeMounts:
+    - mountPath: /var/log/pods
+      name: varlogpods
+      readOnly: true
+
