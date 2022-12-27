@@ -1,4 +1,4 @@
-namespace: &ns my-project
+namespace: &ns my-project2
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -10,7 +10,7 @@ spec:
   finalizers:
   - kubernetes
 ---
-namespace: &ns my-project
+namespace: &ns my-project2
 apiVersion: v1
 kind: Pod
 metadata:

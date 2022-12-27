@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,15 +37,15 @@ const (
 
 	EventChanSize = 4096
 
-	// DO NOT USE THIS
-	flags uint32 = unix.IN_MOVED_TO | unix.IN_MOVED_FROM |
-		unix.IN_CREATE | unix.IN_ATTRIB | unix.IN_MODIFY |
-		unix.IN_MOVE_SELF | unix.IN_DELETE | unix.IN_DELETE_SELF
+	RootDir = "/var/log/pods"
+	SelfDir = "logwatcher"
 )
 
 var (
-	Sizes              = map[string]int64{}
-	TotalEvents uint64 = 0
+	sizemtx              = sync.Mutex{}
+	Sizes                = map[string]int64{}
+	HandledEvents uint64 = 0
+	SentEvents    uint64 = 0
 )
 
 type NotifyEvent struct {
@@ -52,6 +54,8 @@ type NotifyEvent struct {
 }
 
 type Notify struct {
+	rootDir     string
+	namespaces  map[string]struct{}
 	fd          int
 	inotifyFile *os.File // used for read()ing events
 	watches     map[string]int
@@ -81,75 +85,31 @@ func New(root string) (*Notify, error) {
 		return nil, err
 	}
 	n := &Notify{
+		rootDir:     root,
 		fd:          fd,
 		inotifyFile: os.NewFile(uintptr(fd), ""),
 		mtx:         sync.RWMutex{},
 		events:      make(chan NotifyEvent, EventChanSize),
 		paths:       map[int]string{},
 		watches:     map[string]int{},
+		namespaces:  map[string]struct{}{},
 	}
 	return n, n.WatchDir(root)
 }
 
-func (n *Notify) WatchDir(dir string) error {
-	n.mtx.Lock()
-	defer n.mtx.Unlock()
-	return n.watchPathWith(dir, FlagsWatchDir)
-}
-
-func (n *Notify) WatchLogFile(path string) error {
-	n.mtx.Lock()
-	defer n.mtx.Unlock()
-	return n.watchPathWith(path, FlagsWatchFile)
-}
-
-func (n *Notify) watchPathWith(path string, flags uint32) error {
-	// n.mtx is already held
-	path = filepath.Clean(path)
-	wfd, err := unix.InotifyAddWatch(n.fd, path, flags)
-	if err != nil {
-		glog.V(3).Infof("error in watch for path: %q, err: %v\n", path, err)
-		return err
+func (n *Notify) Start() {
+	//n.WatchExistingLogs()
+	glog.V(0).Infoln("started....")
+	glog.Flush()
+	MaxEventLoops := 1
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go n.ReadLoop(&wg)
+	for i := 0; i < MaxEventLoops; i++ {
+		wg.Add(1)
+		go n.Handleloop(&wg, i)
 	}
-	glog.V(3).Infof("added watch for path: %q\n", path)
-	/*
-		oldwfd, ok := n.watches[path]
-		if ok {
-			//debug.PrintStack()
-			// should not happen in ideal case
-			//n.removeWatch(oldwfd, path)
-		}
-	*/
-	n.watches[path] = wfd
-	n.paths[wfd] = path
-	//
-	entries := make([]string, 0, len(n.watches))
-	for pathname := range n.watches {
-		entries = append(entries, pathname)
-	}
-	l := strings.Join(entries, ",\n")
-	glog.V(3).Infof("Watching \n%s\n", l)
-	//
-	return nil
-}
-
-func (n *Notify) RemoveWatch(wfd int, path string) {
-	n.mtx.Lock()
-	defer n.mtx.Unlock()
-	n.removeWatch(wfd, path)
-}
-
-func (n *Notify) removeWatch(wfd int, path string) {
-	unix.InotifyRmWatch(n.fd, uint32(wfd))
-	glog.V(3).Infof("removed watch for path: %q\n", path)
-	delete(n.watches, path)
-	delete(n.paths, wfd)
-	entries := make([]string, 0, len(n.watches))
-	for pathname := range n.watches {
-		entries = append(entries, pathname)
-	}
-	l := strings.Join(entries, ",\n")
-	glog.V(3).Infof("Watching \n%s\n", l)
+	wg.Wait()
 }
 
 func (n *Notify) ReadLoop(wg *sync.WaitGroup) {
@@ -171,10 +131,12 @@ func (n *Notify) ReadLoop(wg *sync.WaitGroup) {
 		if err != nil {
 			if errors.Unwrap(err) == io.EOF {
 			}
+			glog.Errorf("Error in ReadLoop. breaking the loop. err: %v", err)
 			// break the loop
 			break
 		}
 		if readbytes <= 0 {
+			glog.Errorf("readbytes <= 0. breaking the loop. readbytes: %d", readbytes)
 			break
 		}
 		events := 0
@@ -185,13 +147,19 @@ func (n *Notify) ReadLoop(wg *sync.WaitGroup) {
 			consumed += unix.SizeofInotifyEvent
 			path := string(buf[offset+unix.SizeofInotifyEvent : offset+unix.SizeofInotifyEvent+raw.Len])
 			consumed += int(raw.Len)
+			offset += unix.SizeofInotifyEvent + raw.Len
+			/*
+				if raw.Mask&unix.IN_IGNORED == unix.IN_IGNORED {
+					continue
+				}
+			*/
 			e := NotifyEvent{
 				InotifyEvent: *raw,
 				path:         strings.TrimRight(path, "\x00"),
 			}
 			n.events <- e
 			events += 1
-			offset += unix.SizeofInotifyEvent + e.Len
+			atomic.AddUint64(&SentEvents, 1)
 		}
 		if readbytes-consumed != 0 {
 			glog.V(0).Infof("Read %d bytes, %d events, consumed %d bytes, remaining %d bytes", readbytes, events, consumed, (readbytes - consumed))
@@ -203,6 +171,7 @@ func (n *Notify) ReadLoop(wg *sync.WaitGroup) {
 
 func (n *Notify) Handleloop(wg *sync.WaitGroup, idx int) {
 	var tickerCh <-chan time.Time
+	// start ticker in first goroutine only
 	if idx == 0 {
 		tickerCh = time.NewTicker(time.Minute * 1).C
 	}
@@ -210,7 +179,8 @@ func (n *Notify) Handleloop(wg *sync.WaitGroup, idx int) {
 		glog.V(3).Info("--------- going to select ---------")
 		select {
 		case e := <-n.events:
-			atomic.AddUint64(&TotalEvents, 1)
+			handled := false
+			atomic.AddUint64(&HandledEvents, 1)
 			if e.IsOverFlowErr() {
 				glog.Exit("Overflow occured. Exiting program.")
 			}
@@ -218,98 +188,134 @@ func (n *Notify) Handleloop(wg *sync.WaitGroup, idx int) {
 			watchedPath, ok := n.paths[int(e.Wd)]
 			n.mtx.RUnlock()
 			if !ok {
-				glog.Error("A watch event received for an unknown watched path. Event Mask:", e.Mask)
+				glog.Errorf("A watch event received for an unknown watched path. Fd: %d, Event Mask: %x", e.Wd, e.Mask)
 				continue
 			}
-			glog.V(3).Infof("event for watchedPath: %q, for path: %q, mask is: %x", watchedPath, e.path, e.Mask)
+			glog.V(0).Infof("event for watchedPath: %q, for path: %q, mask is: %x", watchedPath, e.path, e.Mask)
+			switch {
+			case e.IsDir() && e.path != "":
+				glog.V(5).Infof("something happened to a subdirectory: %q in %q", e.path, watchedPath)
+			case !e.IsDir() && e.path != "":
+				glog.V(5).Infof("something happened to a file: %q in %q", e.path, watchedPath)
+			case e.IsDir() && e.path == "":
+				glog.V(5).Infof("1. something happened to a watchedPath (file or directry) %q", watchedPath)
+			case !e.IsDir() && e.path == "":
+				glog.V(5).Infof("2. something happened to a watchedPath (file or directry) %q", watchedPath)
+			}
 			if e.IsDir() {
 				switch {
 				case e.Mask&unix.IN_CREATE != 0:
-					glog.V(3).Infof("a new directory got created: %q", e.path)
+					if watchedPath == RootDir {
+						glog.V(0).Infof("a new namespace/pod got created %q", e.path)
+						n.namespaces[e.path] = struct{}{}
+					} else {
+						glog.V(0).Infof("a new container got created %q", e.path)
+					}
 					must(n.WatchDir(filepath.Join(watchedPath, e.path)))
+					handled = true
 
 				case e.Mask&unix.IN_DELETE != 0:
-					glog.V(3).Infof("a directory got deleted: %q", e.path)
-					n.RemoveWatch(int(e.Wd), filepath.Join(watchedPath, e.path))
+					glog.V(0).Infof("a directory got deleted: %q/%q", watchedPath, e.path)
+					dir := filepath.Join(watchedPath, e.path)
+					fd, ok := n.watches[dir]
+					if ok {
+						n.RemoveWatch(fd, dir)
+					} else {
+						glog.Errorf("could not find fd for deleted directory: %q", dir)
+					}
+					handled = true
 
 				case e.Mask&unix.IN_DELETE_SELF != 0:
 					n.RemoveWatch(int(e.Wd), watchedPath)
-					glog.V(3).Infof("a watched directory got deleted: %q", e.path)
+					glog.V(0).Infof("a watched directory got deleted: %q", e.path)
+					handled = true
 
 				case e.Mask&unix.IN_IGNORED != 0:
-					glog.V(5).Infof("got IGNORED event for path: %q", filepath.Join(watchedPath, e.path))
+					glog.V(9).Infof("received IGNORED event for path: %q, ignoring it", filepath.Join(watchedPath, e.path))
+					if strings.Contains(watchedPath, "json-log") {
+						glog.V(9).Infof("got IGNORED event for path: %q, Mask: %x\n", filepath.Join(watchedPath, e.path), e.Mask)
+					}
 
 				default:
-					glog.Error("unhandled event type. path: %q, mask: %x", e.path, e.Mask)
+					glog.Errorf("unhandled event type. watchedPath: %q, e.path: %q, mask: %x", watchedPath, e.path, e.Mask)
 				}
 			} else {
 				switch {
 				case e.Mask&unix.IN_CREATE != 0:
-					glog.V(3).Infof("a new file got created: %q\n", e.path)
+					glog.V(0).Infof("a new log file got created: %q\n", e.path)
 					must(n.WatchLogFile(filepath.Join(watchedPath, e.path)))
 					file := filepath.Join(watchedPath, e.path)
-					if s, err := os.Stat(file); err == nil {
-						glog.V(3).Infof("file: %q size: %d\n", file, s.Size())
-						Sizes[file] = s.Size()
-					} else if errors.Is(err, os.ErrNotExist) {
+					err := UpdateFileSize(file)
+					if err != nil {
 						n.RemoveWatch(int(e.Wd), file)
-					} else {
-						glog.Error(err)
 					}
+					handled = true
 
 				case e.Mask&unix.IN_DELETE != 0:
-					glog.V(3).Infof("a file got deleted: %q??, fd: %d\n", e.path, e.Wd)
-					n.RemoveWatch(int(e.Wd), filepath.Join(watchedPath, e.path))
+					file := filepath.Join(watchedPath, e.path)
+					fd, ok := n.watches[file]
+					if ok {
+						glog.V(0).Infof("a file got deleted: %q??, fd: %d\n", file, fd)
+						n.RemoveWatch(fd, file)
+					} else {
+						glog.Errorf("could not find watch fd for deleted file %q", file)
+					}
+					handled = true
 
 				case e.Mask&unix.IN_DELETE_SELF != 0:
-					glog.V(3).Infof("a watched file got deleted: %q??\n", e.path)
-					n.RemoveWatch(int(e.Wd), filepath.Join(watchedPath, e.path))
+					glog.V(0).Infof("a watched file got self deleted: %q??\n", e.path)
+					//n.RemoveWatch(int(e.Wd), filepath.Join(watchedPath, e.path))
 
 				case e.Mask&unix.IN_MODIFY != 0:
 					glog.V(3).Infof("a file got written: %q\n", watchedPath)
 					must(n.WatchLogFile(watchedPath))
-					if s, err := os.Stat(watchedPath); err == nil {
-						glog.V(3).Infof("file: %q size: %d\n", watchedPath, s.Size())
-						Sizes[watchedPath] = s.Size()
-					} else if errors.Is(err, os.ErrNotExist) {
+					err := UpdateFileSize(watchedPath)
+					must(err)
+					if err != nil {
+						glog.Errorf("Error in stat. file: %q, err: %v", watchedPath, err)
 						n.RemoveWatch(int(e.Wd), watchedPath)
-					} else {
-						glog.Error(err)
 					}
+					handled = true
 
 				case e.Mask&unix.IN_IGNORED != 0:
-					glog.V(3).Infof("got IGNORED event for path: %q\n", filepath.Join(watchedPath, e.path))
+					glog.V(9).Infof("got IGNORED event for path: %q\n", filepath.Join(watchedPath, e.path))
+					if strings.Contains(watchedPath, "json-log") {
+						glog.V(9).Infof("got IGNORED event for path: %q, Mask: %x\n", filepath.Join(watchedPath, e.path), e.Mask)
+					}
 
 				case e.Mask&unix.IN_CLOSE_WRITE != 0:
 					glog.V(0).Infof("a file opened for writing got closed: %q", watchedPath)
-					if s, err := os.Stat(watchedPath); err == nil {
-						glog.V(3).Infof("file: %q size: %d\n", watchedPath, s.Size())
-						Sizes[watchedPath] = s.Size()
-					} else if errors.Is(err, os.ErrNotExist) {
-						n.RemoveWatch(int(e.Wd), watchedPath)
-					} else {
-						glog.Error(err)
-					}
+					UpdateFileSize(watchedPath)
+					// we add watch because file still exists, and could be written to again
+					must(n.WatchLogFile(watchedPath))
+					handled = true
 
 				default:
-					glog.V(0).Infof("unhandled event type. watchedPath: %q, e.path: %q, mask: %x", watchedPath, e.path, e.Mask)
+					glog.Errorf("unhandled event type. watchedPath: %q, e.path: %q, mask: %x", watchedPath, e.path, e.Mask)
 				}
 			}
+			if !handled && e.Mask != 0x8000 {
+				glog.Errorf("----- event not handled. watchedPath: %q, e.path: %q, mask: %x", watchedPath, e.path, e.Mask)
+			}
 		case <-tickerCh:
-			n.mtx.RLock()
-			wl := n.WatchList()
-			n.mtx.RUnlock()
-
-			l := strings.Join(wl, ",\n")
-			glog.V(0).Infof("Watching (%d) paths: \n%s\n", len(wl), l)
 			/**/
-			glog.V(0).Infof("sizes(%d): %s\nEventsReceived: %d\n", len(Sizes), func(m map[string]int64) string {
+			sizemtx.Lock()
+			glog.V(0).Infof("sizes(%d): %s\nEventsSent: %d, EventsHandled: %d\n", len(Sizes), func(m map[string]int64) string {
 				p, err := json.MarshalIndent(m, "", "  ")
 				if err != nil {
 					return fmt.Sprintf("%v", err)
 				}
 				return string(p)
-			}(Sizes), TotalEvents)
+			}(Sizes), SentEvents, HandledEvents)
+			sizemtx.Unlock()
+			/**/
+			/**/
+			n.mtx.RLock()
+			wl := n.WatchList()
+			n.mtx.RUnlock()
+
+			l := strings.Join(wl, ",\n")
+			glog.V(0).Infof("Watching paths: \n%s\nTotal watches: %d\n", l, len(wl))
 			/**/
 		}
 	}
@@ -317,18 +323,131 @@ func (n *Notify) Handleloop(wg *sync.WaitGroup, idx int) {
 	glog.V(3).Info("exiting Handleloop")
 }
 
+func (n *Notify) WatchExistingLogs() {
+	filepath.WalkDir(n.rootDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == n.rootDir {
+			return nil
+		}
+		// do not watch self dir else results in a positive feedback loop
+		if d.Name() == SelfDir && d.IsDir() {
+			glog.V(0).Infof("skipping reading self dir: %s", SelfDir)
+			return filepath.SkipDir
+		}
+		glog.V(3).Infof("checking dir: %s", path)
+
+		if d.IsDir() {
+			glog.V(0).Infof("watching directory %q", path)
+			return n.WatchDir(path)
+		} else {
+			err2 := n.WatchLogFile(path)
+			if err2 != nil {
+				return err2
+			}
+			err2 = UpdateFileSize(path)
+			//	if err2 != nil {
+			//		n.RemoveWatch(0, path)
+			//	}
+			return err2
+		}
+		return nil
+	})
+}
+
 func (n *Notify) WatchList() []string {
 	n.mtx.RLock()
 	defer n.mtx.RUnlock()
 
 	entries := make([]string, 0, len(n.watches))
-	for pathname := range n.watches {
-		entries = append(entries, pathname)
+	for pathname, fd := range n.watches {
+		entries = append(entries, fmt.Sprintf("%6x, %q", fd, pathname))
 	}
 
 	return entries
 }
 
+func (n *Notify) WatchDir(dir string) error {
+	n.mtx.Lock()
+	defer n.mtx.Unlock()
+	return n.watchPathWith(dir, FlagsWatchDir)
+}
+
+func (n *Notify) WatchLogFile(path string) error {
+	n.mtx.Lock()
+	defer n.mtx.Unlock()
+	return n.watchPathWith(path, FlagsWatchFile)
+}
+
+func (n *Notify) watchPathWith(path string, flags uint32) error {
+	// n.mtx is already held
+	path = filepath.Clean(path)
+	wfd, err := unix.InotifyAddWatch(n.fd, path, flags)
+	if wfd == -1 {
+		glog.V(0).Infof("error in watch for path: %q, err: %v\n", path, err)
+		debug.PrintStack()
+		return err
+	}
+	glog.V(3).Infof("added watch for path: %q\n", path)
+	/*
+		oldwfd, ok := n.watches[path]
+		if ok {
+			//debug.PrintStack()
+			// should not happen in ideal case
+			//n.removeWatch(oldwfd, path)
+		}
+	*/
+	n.watches[path] = wfd
+	n.paths[wfd] = path
+	//
+	/*
+		entries := make([]string, 0, len(n.watches))
+		for pathname := range n.watches {
+			entries = append(entries, pathname)
+		}
+		l := strings.Join(entries, ",\n")
+		glog.V(3).Infof("Watching \n%s\n", l)
+	*/
+	//
+	return nil
+}
+
+func (n *Notify) RemoveWatch(wfd int, path string) {
+	n.mtx.Lock()
+	defer n.mtx.Unlock()
+	n.removeWatch(wfd, path)
+}
+
+func (n *Notify) removeWatch(wfd int, path string) {
+	ret, err := unix.InotifyRmWatch(n.fd, uint32(wfd))
+	if ret == -1 {
+		glog.V(0).Infof("error in watch for path: %q, err: %v\n", path, err)
+		debug.PrintStack()
+	}
+	glog.V(0).Infof("removed watch for path: %q\n", path)
+	delete(n.watches, path)
+	delete(n.paths, wfd)
+	/*
+		entries := make([]string, 0, len(n.watches))
+		for pathname := range n.watches {
+			entries = append(entries, pathname)
+		}
+		l := strings.Join(entries, ",\n")
+		glog.V(3).Infof("Watching \n%s\n", l)
+	*/
+}
+func UpdateFileSize(path string) error {
+	s, err := os.Stat(path)
+	if err != nil {
+		glog.Error("could not stat file: ", path, err)
+		return err
+	}
+	sizemtx.Lock()
+	Sizes[path] = s.Size()
+	sizemtx.Unlock()
+	return nil
+}
 func must(err error) {
 	if err != nil {
 		glog.Exit("Exiting with error: ", err)

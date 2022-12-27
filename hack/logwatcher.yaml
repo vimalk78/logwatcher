@@ -25,7 +25,8 @@ spec:
   containers:
   - name: logwatcher
     image: image-registry.openshift-image-registry.svc:5000/openshift/logwatcher:v0.0.1
-    args: ["sh", "-c", "/usr/local/bin/logwatcher -watch_dir=/var/log/pods -v=9 -logtostderr=true"]
+    imagePullPolicy: Always
+    args: ["sh", "-c", "/usr/local/bin/logwatcher -watch_dir=/var/log/pods -v=5 -logtostderr=true"]
     securityContext:
       allowPrivilegeEscalation: false
       capabilities:
