@@ -19,7 +19,16 @@ code: &code-str |
     data["msgcontent"]="My life is my message"
     data["facility_key"]="local0"
     data["severity_key"]="Informational"
-    data["mykey"]="myvalue"
+    data["mykey0"]="myvalue"
+    data["mykey1"]="myvalue"
+    data["mykey2"]="myvalue"
+    data["mykey3"]="myvalue"
+    data["mykey4"]="myvalue"
+    data["mykey5"]="myvalue"
+    data["mykey6"]="myvalue"
+    data["mykey7"]="myvalue"
+    data["mykey8"]="myvalue"
+    data["mykey9"]="myvalue"
   i=0
   while True:
     i=i+1
@@ -31,7 +40,7 @@ code: &code-str |
     set_vals()
     print json.dumps(data)
     sys.stdout.flush()
-    time.sleep(0.5) # sleep for 100 msec
+    time.sleep(0.1) # sleep for 100 msec
 
 spec:
   containers:
