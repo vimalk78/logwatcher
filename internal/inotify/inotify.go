@@ -18,21 +18,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-/**
-A brief note on inotify flags used for watching files.
-======================================================
-
-
-
-**/
 const (
 	FlagsWatchDir = unix.IN_CREATE | // File/directory created in watched directory
 		unix.IN_DELETE // File/directory deleted from watched directory.
 		//unix.IN_DELETE_SELF //  Watched file/directory was itself deleted.
 
 	FlagsWatchFile = unix.IN_MODIFY | // File was modified (e.g., write(2), truncate(2)).
-		unix.IN_ONESHOT | // Monitor the filesystem object corresponding to pathname for one event, then remove from watch list.
-		unix.IN_CLOSE_WRITE // File opened for writing was closed.
+		unix.IN_CLOSE_WRITE | // File opened for writing was closed.
+		unix.IN_ONESHOT // Monitor the filesystem object corresponding to pathname for one event, then remove from watch list.
 
 	EventChanSize = 4096
 
@@ -84,7 +77,7 @@ func New(root string) (*Notify, error) {
 }
 
 func (n *Notify) Start() {
-	//n.WatchExistingLogs()
+	n.WatchExistingLogs()
 	glog.V(0).Infoln("started....")
 	glog.Flush()
 	// Suggest to keep num of loops to 1, else events may be handled out of order
@@ -92,6 +85,7 @@ func (n *Notify) Start() {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go n.ReadLoop(&wg)
+	// TODO: remove the looping, need only one EventLoop goroutine
 	for i := 0; i < MaxEventLoops; i++ {
 		wg.Add(1)
 		go n.EventLoop(&wg, i)
@@ -121,7 +115,6 @@ func (n *Notify) ReadLoop(wg *sync.WaitGroup) {
 				glog.Errorf("Received EOF on inotify file descriptor")
 			}
 			glog.Errorf("Error in ReadLoop. breaking the loop. err: %v", err)
-			// break the loop
 			break
 		}
 		if readbytes <= 0 {

@@ -40,6 +40,10 @@ code: &code-str |
     set_vals()
     print json.dumps(data)
     sys.stdout.flush()
+    // uncomment below two lines for testing a container restart.
+    // once container exits, it will be restarted, and log file will rotate as 0.log, 1.log, 2.log ....
+    // if i == 1000:
+    //   sys.exit(-1)
     time.sleep(0.1) # sleep for 100 msec
 
 spec:
